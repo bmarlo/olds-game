@@ -17,10 +17,13 @@ impl OldsGame {
 
     fn play(&mut self) {
         self.draw_board();
-        loop {
+        let mut winner = None;
+        while winner.is_none() {
             self.make_move();
             self.draw_board();
+            winner = self.check_win();
         }
+        println!(" --- got winner: {} :D", winner.unwrap());
     }
 
     fn make_move(&mut self) {
@@ -100,6 +103,76 @@ impl OldsGame {
         }
         self.board.pop();
         self.board.push('\n');
+    }
+
+    fn check_win(&self) -> Option<char> {
+        let get_horizontal = |k: usize, m: usize| {
+            self.state[k][m]
+        };
+
+        let get_vertical = |k: usize, m: usize| {
+            self.state[m][k]
+        };
+
+        match self.check_straight(get_horizontal) {
+            Some(value) => return Some(value),
+            None => {}
+        }
+
+        match self.check_straight(get_vertical) {
+            Some(value) => return Some(value),
+            None => {}
+        }
+
+        let get_main = |k: usize| {
+            self.state[k][k]
+        };
+
+        let get_anti = |k: usize| {
+            self.state[k][OldsGame::BOARD_SIZE - k - 1]
+        };
+
+        match self.check_diagonal(get_main) {
+            Some(value) => return Some(value),
+            None => {}
+        }
+
+        match self.check_diagonal(get_anti) {
+            Some(value) => return Some(value),
+            None => {}
+        }
+
+        None
+    }
+
+    fn check_straight<F: Fn(usize, usize) -> char>(&self, get_value: F) -> Option<char> {
+        for k in 0 .. OldsGame::BOARD_SIZE {
+            let value = get_value(k, 0);
+            if value != ' ' {
+                let mut all = true;
+                for m in 1 .. OldsGame::BOARD_SIZE {
+                    all &= get_value(k, m) == value;
+                }
+                if all {
+                    return Some(value);
+                }
+            }
+        }
+        None
+    }
+
+    fn check_diagonal<F: Fn(usize) -> char>(&self, get_value: F) -> Option<char> {
+        let value = get_value(0);
+        if value != ' ' {
+            let mut all = true;
+            for k in 1 .. OldsGame::BOARD_SIZE {
+                all &= get_value(k) == value;
+            }
+            if all {
+                return Some(value);
+            }
+        }
+        None
     }
 }
 
