@@ -1,7 +1,15 @@
-use std::io::{self, Write};
+use std::{io::{self, Write}, time::{SystemTime, UNIX_EPOCH}};
+
+fn random_number() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() as usize
+}
 
 struct OldsGame {
     state: [[char; OldsGame::BOARD_SIZE]; OldsGame::BOARD_SIZE],
+    slots: usize,
     board: String
 }
 
@@ -11,6 +19,7 @@ impl OldsGame {
     fn new() -> OldsGame {
         OldsGame {
             state: [[' '; OldsGame::BOARD_SIZE]; OldsGame::BOARD_SIZE],
+            slots: OldsGame::BOARD_SIZE * OldsGame::BOARD_SIZE,
             board: String::new()
         }
     }
@@ -18,17 +27,29 @@ impl OldsGame {
     fn play(&mut self) {
         self.draw_board();
         let mut winner = None;
-        while winner.is_none() {
+        while winner.is_none() && self.slots > 0 {
             self.make_move();
+            winner = self.check_win();
+            if winner.is_some() {
+                self.draw_board();
+                break;
+            }
+            self.random_move();
             self.draw_board();
             winner = self.check_win();
         }
-        println!(" --- got winner: {} :D", winner.unwrap());
+
+        if winner.is_some() {
+            println!(" --- got winner: {} :D", winner.unwrap());
+        } else {
+            println!(" --- it's a draw :/");
+        }
     }
 
     fn make_move(&mut self) {
         let (x, y) = self.get_input();
         self.state[x][y] = 'x';
+        self.slots -= 1;
     }
 
     fn get_input(&self) -> (usize, usize) {
@@ -103,6 +124,21 @@ impl OldsGame {
         }
         self.board.pop();
         self.board.push('\n');
+    }
+
+    fn random_move(&mut self) {
+        if self.slots > 0 {
+            let (mut x, mut y);
+            loop {
+                x = random_number() % OldsGame::BOARD_SIZE;
+                y = random_number() % OldsGame::BOARD_SIZE;
+                if self.state[x][y] == ' ' {
+                    break;
+                }
+            }
+            self.state[x][y] = 'o';
+            self.slots -= 1;
+        }
     }
 
     fn check_win(&self) -> Option<char> {
