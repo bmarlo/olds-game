@@ -1,4 +1,15 @@
-use std::{io::{self, Write}, time::{SystemTime, UNIX_EPOCH}};
+use std::io::{self, Write, Result, Error, ErrorKind};
+use std::net::{UdpSocket, SocketAddrV4, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use bytebuffer::{ByteBuffer, Endian};
+use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+
+fn get_time() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
+}
 
 fn random_number() -> usize {
     SystemTime::now()
@@ -7,24 +18,120 @@ fn random_number() -> usize {
         .subsec_nanos() as usize
 }
 
+fn next_number() -> u16 {
+    static COUNTER: AtomicU16 = AtomicU16::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn broadcast(socket: &mut UdpSocket, packet: &[u8], port: u16) -> Result<()> {
+    match NetworkInterface::show() {
+        Ok(ifaces) => {
+            for entry in ifaces {
+                match entry.addr {
+                    Some(iface) => {
+                        match iface.broadcast() {
+                            Some(addr) => {
+                                if addr.is_ipv4() {
+                                    let mut str = addr.to_string();
+                                    str.push(':');
+                                    str.push_str(port.to_string().as_str());
+                                    socket.send_to(packet, &str)?;
+                                }
+                            },
+                            None => {}
+                        }
+                    },
+                    None => {}
+                }
+            }
+            Ok(())
+        },
+        Err(_) => Err(Error::new(ErrorKind::Other, "can't get interfaces"))
+    }
+}
+
 struct OldsGame {
+    player: char,
     state: [[char; OldsGame::BOARD_SIZE]; OldsGame::BOARD_SIZE],
     slots: usize,
-    board: String
+    board: String,
+    socket: UdpSocket,
+    bound: bool
 }
 
 impl OldsGame {
     const BOARD_SIZE: usize = 3;
+    const LAN_PORT: u16 = 54545;
+    const TIMEOUT: u128 = 30000;
 
     fn new() -> OldsGame {
+        let mut bound = false;
+        let any = Ipv4Addr::new(0, 0, 0, 0);
+        let addr = SocketAddrV4::new(any, OldsGame::LAN_PORT);
+        let socket: Option<UdpSocket>;
+        match UdpSocket::bind(addr) {
+            Ok(value) => {
+                socket = Some(value);
+                bound = true;
+            },
+            Err(_) => {
+                let addr = SocketAddrV4::new(any, 0);
+                match UdpSocket::bind(addr) {
+                    Ok(value) => socket = Some(value),
+                    Err(_) => panic!("can't open socket")
+                }
+            }
+        }
+
+        let socket = socket.unwrap();
+        socket.set_broadcast(true).expect("can't set socket broadcast option");
+        socket.set_nonblocking(true).expect("can't set socket to nonblocking mode");
+
         OldsGame {
+            player: 'x',
             state: [[' '; OldsGame::BOARD_SIZE]; OldsGame::BOARD_SIZE],
             slots: OldsGame::BOARD_SIZE * OldsGame::BOARD_SIZE,
-            board: String::new()
+            board: String::new(),
+            socket: socket,
+            bound: bound
         }
     }
 
+    fn is_localhost(&self) -> bool {
+        !self.bound
+    }
+
+    fn is_multiplayer(&self) -> bool {
+        self.socket.peer_addr().is_ok()
+    }
+
     fn play(&mut self) {
+        println!("Finding opponent...");
+        if self.is_localhost() {
+            if self.connect("127.0.0.1").is_ok() {
+                self.multiplayer();
+            } else {
+                println!(" --- can't connect to remote player");
+                self.singleplayer();
+            }
+        } else {
+            let mut probe = Packet::new(Opcode::Ping);
+            if self.send(&mut probe, true).is_ok() {
+                self.multiplayer();
+            } else {
+                println!(" --- none found, waiting connection");
+                if self.accept().is_ok() {
+                    self.multiplayer();
+                } else {
+                    println!(" --- connection timeout");
+                    self.singleplayer();
+                }
+            }
+        }
+    }
+
+    fn singleplayer(&mut self) {
+        println!("\nSingle-player mode");
         self.draw_board();
         let mut winner = None;
         while winner.is_none() && self.slots > 0 {
@@ -46,10 +153,18 @@ impl OldsGame {
         }
     }
 
+    fn multiplayer(&mut self) {
+        println!(" --- connected to {}", self.socket.peer_addr().unwrap());
+        println!("\nMultiplayer mode");
+    }
+
     fn make_move(&mut self) {
         let (x, y) = self.get_input();
         self.state[x][y] = 'x';
         self.slots -= 1;
+        if self.is_multiplayer() {
+            // TODO send move
+        }
     }
 
     fn get_input(&self) -> (usize, usize) {
@@ -62,7 +177,7 @@ impl OldsGame {
             line.clear();
             print!("Enter position: ");
             io::stdout().flush().ok();
-            stdin.read_line(&mut line).unwrap();
+            stdin.read_line(&mut line).expect("can't get input");
             line = line.trim().to_owned();
             let entries: Vec<&str> = line.split_whitespace().collect();
             if entries.len() != 2 {
@@ -141,6 +256,102 @@ impl OldsGame {
         }
     }
 
+    fn send(&mut self, packet: &mut Packet, bcast: bool) -> Result<()> {
+        let bytes = packet.encode().to_bytes();
+        let mut rxbuffer = vec![0; Packet::MAX_SIZE];
+
+        for _ in 0 .. 3 {
+            if bcast {
+                broadcast(&mut self.socket, &bytes, OldsGame::LAN_PORT)?;
+            } else {
+                self.socket.send(bytes.as_ref())?;
+            }
+
+            let deadline = get_time() + 1000;
+            while get_time() < deadline {
+                let (n, remote);
+                match self.socket.recv_from(&mut rxbuffer) {
+                    Ok(res) => (n, remote) = res,
+                    Err(error) => {
+                        if error.kind() == ErrorKind::WouldBlock {
+                            n = 0;
+                            remote = SocketAddr::V4(SocketAddrV4::from_str("0.0.0.0:0").unwrap());
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
+                if !(n > 0) {
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+
+                let mut reply = Packet::new(Opcode::Ack);
+                let mut tmp = ByteBuffer::from_bytes(&rxbuffer);
+                tmp.set_wpos(n);
+                tmp.set_endian(Endian::BigEndian);
+                if reply.parse(&mut tmp) && reply.is_ack() && reply.number() == packet.number() {
+                    if bcast {
+                        self.socket.connect(remote)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(Error::new(ErrorKind::TimedOut, "timeout"))
+    }
+
+    fn connect(&mut self, host: &str) -> Result<()> {
+        let host = Ipv4Addr::from_str(host).expect("not an IPv4 literal");
+        let addr = SocketAddrV4::new(host, OldsGame::LAN_PORT);
+        self.socket.connect(addr)?;
+        let mut ping = Packet::new(Opcode::Ping);
+        self.send(&mut ping, false)
+    }
+
+    fn accept(&mut self) -> Result<()> {
+        let mut rxbuffer = vec![0; Packet::MAX_SIZE];
+        let deadline = get_time() + OldsGame::TIMEOUT;
+
+        while get_time() < deadline {
+            let (n, remote);
+            match self.socket.recv_from(&mut rxbuffer) {
+                Ok(res) => (n, remote) = res,
+                Err(error) => {
+                    if error.kind() == ErrorKind::WouldBlock {
+                        n = 0;
+                        remote = SocketAddr::V4(SocketAddrV4::from_str("0.0.0.0:0").unwrap());
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            if !(n > 0) {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+
+            let mut request = Packet::new(Opcode::Ping);
+            let mut tmp = ByteBuffer::from_bytes(&rxbuffer);
+            tmp.set_wpos(n);
+            tmp.set_endian(Endian::BigEndian);
+            if request.parse(&mut tmp) && request.is_ping() {
+                let mut reply = Packet::new(Opcode::Ack);
+                reply.set_number(request.number());
+                self.socket.connect(remote)?;
+                self.player = 'o';
+                let bytes = reply.encode().to_bytes();
+                match self.socket.send(bytes.as_ref()) {
+                    Ok(_) => return Ok(()),
+                    Err(error) => return Err(error)
+                }
+            }
+        }
+
+        Err(Error::new(ErrorKind::TimedOut, "timeout"))
+    }
+
     fn check_win(&self) -> Option<char> {
         let get_horizontal = |k: usize, m: usize| {
             self.state[k][m]
@@ -209,6 +420,125 @@ impl OldsGame {
             }
         }
         None
+    }
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Opcode {
+    Ping = 0x01, Ack, Data
+}
+
+struct Packet {
+    opcode: Opcode,
+    number: u16,
+    data: Option<(u16, u16)>
+}
+
+#[allow(unused)]
+impl Packet {
+    const MIN_SIZE: usize = 4;
+    const MAX_SIZE: usize = 8;
+
+    fn new(opcode: Opcode) -> Packet {
+        Packet {
+            opcode: opcode,
+            number: next_number(),
+            data: None
+        }
+    }
+
+    fn new_data(x: usize, y: usize) -> Packet {
+        Packet {
+            opcode: Opcode::Data,
+            number: next_number(),
+            data: Some((x as u16, y as u16))
+        }
+    }
+
+    fn is_ping(&self) -> bool {
+        self.opcode == Opcode::Ping
+    }
+
+    fn is_ack(&self) -> bool {
+        self.opcode == Opcode::Ack
+    }
+
+    fn is_data(&self) -> bool {
+        self.opcode == Opcode::Data
+    }
+
+    fn set_number(&mut self, value: u16) {
+        self.number = value
+    }
+
+    fn set_data(&mut self, x: usize, y: usize) {
+        if self.is_data() {
+            self.data = Some((x as u16, y as u16));
+        }
+    }
+
+    fn what(&self) -> Opcode {
+        self.opcode
+    }
+
+    fn number(&self) -> u16 {
+        self.number
+    }
+
+    fn data(&self) -> Option<(u16, u16)> {
+        self.data
+    }
+
+    fn size(&self) -> usize {
+        if self.is_data() {
+            Packet::MAX_SIZE
+        } else {
+            Packet::MIN_SIZE
+        }
+    }
+
+    fn encode(&mut self) -> ByteBuffer {
+        let mut packet = ByteBuffer::new();
+        packet.set_endian(Endian::BigEndian);
+        packet.write_u16(self.opcode as u16);
+        packet.write_u16(self.number);
+        if self.is_data() {
+            let (x, y) = self.data.expect("data not set");
+            packet.write_u16(x);
+            packet.write_u16(y);
+        }
+        packet
+    }
+
+    fn parse(&mut self, packet: &mut ByteBuffer) -> bool {
+        let size = packet.get_wpos() - packet.get_rpos();
+        if size < Packet::MIN_SIZE || size > Packet::MAX_SIZE {
+            return false;
+        }
+
+        let code = packet.read_u16().unwrap();
+        if code < Opcode::Ping as u16 || code > Opcode::Data as u16 {
+            return false;
+        }
+
+        let opcode = match code {
+            1 => Opcode::Ping,
+            2 => Opcode::Ack,
+            _ => Opcode::Data
+        };
+
+        self.opcode = opcode;
+        self.number = packet.read_u16().unwrap();
+        if self.is_data() {
+            if size < Packet::MAX_SIZE {
+                return false;
+            }
+            let x = packet.read_u16().unwrap();
+            let y = packet.read_u16().unwrap();
+            self.data = Some((x, y));
+        }
+
+        packet.get_rpos() == packet.get_wpos()
     }
 }
 
