@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bytebuffer-rs = "0.4.0"
+bytebuffer = "2.0.1"
 network-interface = "0.1.3"

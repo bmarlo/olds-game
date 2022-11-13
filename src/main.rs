@@ -319,7 +319,7 @@ impl OldsGame {
                 self.slots -= 1;
                 let mut reply = Packet::new(Opcode::Ack);
                 reply.set_number(request.number());
-                let bytes = reply.encode().to_bytes();
+                let bytes = reply.encode().into_bytes();
                 match self.socket.send(&bytes) {
                     Ok(_) => return Ok(()),
                     Err(error) => return Err(error)
@@ -355,7 +355,7 @@ impl OldsGame {
     }
 
     fn send(&mut self, packet: &Packet, bcast: bool) -> Result<()> {
-        let bytes = packet.encode().to_bytes();
+        let bytes = packet.encode().into_bytes();
         let mut rxbuffer = vec![0; Packet::MAX_SIZE];
 
         for _ in 0 .. 3 {
@@ -411,7 +411,7 @@ impl OldsGame {
                 reply.set_number(request.number());
                 self.socket.connect(remote)?;
                 self.player = 'o';
-                let bytes = reply.encode().to_bytes();
+                let bytes = reply.encode().into_bytes();
                 match self.socket.send(&bytes) {
                     Ok(_) => return Ok(()),
                     Err(error) => return Err(error)
